@@ -1,6 +1,9 @@
 import json
 import logging
 import asyncio
+import re
+import uuid
+import sys
 from flask import Flask, request, Response, stream_with_context, jsonify
 import httpx
 import time
@@ -27,6 +30,7 @@ VALID_API_KEYS = [key.strip() for key in os.getenv("VALID_API_KEYS", "").split("
 # 1: 构造history_message附加到消息中的模式(默认)
 # 2: 零宽字符模式
 CONVERSATION_MEMORY_MODE = int(os.getenv('CONVERSATION_MEMORY_MODE', '1'))
+
 
 class DifyModelManager:
     def __init__(self):
@@ -55,7 +59,7 @@ class DifyModelManager:
                     headers=headers,
                     params={"user": "default_user"}
                 )
-                
+
                 if response.status_code == 200:
                     app_info = response.json()
                     return app_info.get("name", "Unknown App")
@@ -70,7 +74,7 @@ class DifyModelManager:
         """刷新所有应用信息"""
         self.name_to_api_key.clear()
         self.api_key_to_name.clear()
-        
+
         for api_key in self.api_keys:
             app_name = await self.fetch_app_info(api_key)
             if app_name:
@@ -94,6 +98,57 @@ class DifyModelManager:
             for name in self.name_to_api_key.keys()
         ]
 
+
+def parse_tool_use_from_content(content):
+    """从内容中解析tool_use标签并转换为OpenAI的function call格式"""
+    if not content:
+        return None, None
+
+    # 正则表达式匹配tool_use标签
+    tool_use_pattern = r'<tool_use>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_use>'
+    matches = re.findall(tool_use_pattern, content, re.DOTALL)
+
+    if not matches:
+        return content, None
+
+    # 解析所有tool_use匹配
+    tool_calls = []
+    cleaned_content = content
+
+    for name, arguments_str in matches:
+        try:
+            # 解析arguments为JSON
+            arguments = json.loads(arguments_str.strip())
+
+            # 生成唯一的tool call ID
+            tool_call_id = str(uuid.uuid4())
+
+            tool_calls.append({
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": name.strip(),
+                    "arguments": json.dumps(arguments, ensure_ascii=False)
+                }
+            })
+
+            # 从内容中移除tool_use标签
+            tool_use_tag = f"<tool_use>\n  <name>{name}</name>\n  <arguments>{arguments_str}</arguments>\n</tool_use>"
+            cleaned_content = cleaned_content.replace(tool_use_tag, "").strip()
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse tool arguments: {arguments_str}, error: {e}")
+            continue
+        except Exception as e:
+            logger.warning(f"Error parsing tool_use: {e}")
+            continue
+
+    # 清理多余的空行
+    cleaned_content = re.sub(r'\n\s*\n', '\n\n', cleaned_content).strip()
+
+    return cleaned_content, tool_calls
+
+
 # 创建模型管理器实例
 model_manager = DifyModelManager()
 
@@ -102,12 +157,14 @@ DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 
 app = Flask(__name__)
 
+
 def get_api_key(model_name):
     """根据模型名称获取对应的API密钥"""
     api_key = model_manager.get_api_key(model_name)
     if not api_key:
         logger.warning(f"No API key found for model: {model_name}")
     return api_key
+
 
 async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
     """上传图片到Dify并返回文件ID
@@ -118,24 +175,24 @@ async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
         if base64_data.startswith('data:image'):
             # 提取实际的base64数据 (去除data:image/*;base64,前缀)
             base64_data = base64_data.split(',')[1]
-        
+
         import base64
         image_data = base64.b64decode(base64_data)
-        
+
         # 创建临时文件
         import tempfile
         import os
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
             tmp_file.write(image_data)
             tmp_file_path = tmp_file.name
-        
+
         try:
             # 使用httpx上传文件到Dify
             async with httpx.AsyncClient(timeout=None) as client:
                 headers = {
                     "Authorization": f"Bearer {api_key}"
                 }
-                
+
                 # 准备multipart数据用于文件上传
                 # Dify当前仅支持图片类型附件的上传 (PNG, JPG, JPEG, WEBP, GIF)
                 with open(tmp_file_path, 'rb') as file_handle:
@@ -145,14 +202,14 @@ async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
                     data = {
                         'user': user_id
                     }
-                    
+
                     response = await client.post(
                         f"{DIFY_API_BASE}/files/upload",
                         headers=headers,
                         files=files,
                         data=data
                     )
-                
+
                 # 检查上传响应状态码
                 # HTTP 200: OK, HTTP 201: Created
                 if response.status_code in [200, 201]:
@@ -160,13 +217,14 @@ async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
                     logger.info(f"Successfully uploaded image, file_id: {file_info.get('id')}")
                     return file_info.get('id')
                 else:
-                    logger.error(f"Failed to upload image, status_code: {response.status_code}, response: {response.text}")
+                    logger.error(
+                        f"Failed to upload image, status_code: {response.status_code}, response: {response.text}")
                     return None
-                    
+
         except Exception as e:
             logger.error(f"Error uploading image: {str(e)}")
             return None
-            
+
         finally:
             # 确保临时文件被清理，避免磁盘空间泄露
             if tmp_file_path and os.path.exists(tmp_file_path):
@@ -185,24 +243,26 @@ async def upload_image_to_dify(api_key, base64_data, user_id="default_user"):
                             os.unlink(tmp_file_path)
                             logger.debug(f"Temporary file cleaned up after delay: {tmp_file_path}")
                     except Exception as delayed_cleanup_error:
-                        logger.error(f"Failed to cleanup temporary file after delay {tmp_file_path}: {delayed_cleanup_error}")
-            
+                        logger.error(
+                            f"Failed to cleanup temporary file after delay {tmp_file_path}: {delayed_cleanup_error}")
+
     except Exception as e:
         logger.error(f"Error processing image data: {str(e)}")
         return None
 
+
 async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
     """将OpenAI格式的请求转换为Dify格式"""
-    
+
     if endpoint == "/chat/completions":
         messages = openai_request.get("messages", [])
         stream = openai_request.get("stream", False)
         user_id = openai_request.get("user") or "default_user"
         inputs = openai_request.get("inputs", {})
-        
+
         # 尝试从历史消息中提取conversation_id
         conversation_id = None
-        
+
         # 提取system消息内容
         system_content = ""
         system_messages = [msg for msg in messages if msg.get("role") == "system"]
@@ -210,20 +270,20 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
             system_content = system_messages[0].get("content", "")
             # 记录找到的system消息
             logger.info(f"Found system message: {system_content[:100]}{'...' if len(system_content) > 100 else ''}")
-        
+
         # 处理用户消息，支持图片
         user_message = messages[-1] if messages and messages[-1].get("role") != "system" else {}
         user_content = user_message.get("content", "")
-        
+
         # 存储上传的文件ID
         uploaded_files = []
-        
+
         # 检查用户消息是否包含图片
         if isinstance(user_content, list):
             # 处理多模态内容（文本+图片）
             text_parts = []
             image_parts = []
-            
+
             for item in user_content:
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
@@ -231,19 +291,19 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                     image_url = item.get("image_url", {}).get("url", "")
                     if image_url:
                         image_parts.append(image_url)
-            
+
             # 组合文本内容
             user_query = "\n".join(text_parts) if text_parts else ""
-            
+
             # 上传图片文件
             if api_key and image_parts:
                 logger.info(f"Found {len(image_parts)} images to upload")
                 successful_uploads = 0
                 failed_uploads = 0
-                
+
                 for i, image_data in enumerate(image_parts):
                     try:
-                        logger.info(f"Uploading image {i+1}/{len(image_parts)}")
+                        logger.info(f"Uploading image {i + 1}/{len(image_parts)}")
                         file_id = await upload_image_to_dify(api_key, image_data, user_id)
                         if file_id:
                             uploaded_files.append({
@@ -252,29 +312,29 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                                 "upload_file_id": file_id
                             })
                             successful_uploads += 1
-                            logger.info(f"Successfully uploaded image {i+1}/{len(image_parts)}, file_id: {file_id}")
+                            logger.info(f"Successfully uploaded image {i + 1}/{len(image_parts)}, file_id: {file_id}")
                         else:
                             failed_uploads += 1
-                            logger.warning(f"Failed to upload image {i+1}/{len(image_parts)}")
+                            logger.warning(f"Failed to upload image {i + 1}/{len(image_parts)}")
                     except Exception as e:
                         failed_uploads += 1
-                        logger.error(f"Exception occurred while uploading image {i+1}/{len(image_parts)}: {str(e)}")
-                
+                        logger.error(f"Exception occurred while uploading image {i + 1}/{len(image_parts)}: {str(e)}")
+
                 # 记录上传结果统计
                 if successful_uploads > 0:
                     logger.info(f"Uploaded {successful_uploads}/{len(image_parts)} files successfully")
                 if failed_uploads > 0:
                     logger.warning(f"Failed to upload {failed_uploads}/{len(image_parts)} files")
-                
+
                 # 如果所有图片都上传失败，记录警告
                 if successful_uploads == 0 and failed_uploads > 0:
                     logger.warning("All image uploads failed, proceeding with text-only request")
         else:
             # 处理纯文本内容
             user_query = user_content
-        
+
         logger.info(f"Processing request with {len(uploaded_files)} uploaded files")
-        
+
         if CONVERSATION_MEMORY_MODE == 2:  # 零宽字符模式
             if len(messages) > 1:
                 # 遍历历史消息，找到最近的assistant消息
@@ -285,12 +345,12 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                         conversation_id = decode_conversation_id(content)
                         if conversation_id:
                             break
-            
+
             # 如果有system消息且是首次对话(没有conversation_id)，则将system内容添加到用户查询前
             if system_content and not conversation_id:
                 user_query = f"系统指令: {system_content}\n\n用户问题: {user_query}"
                 logger.info(f"[零宽字符模式] 首次对话，添加system内容到查询前")
-            
+
             dify_request = {
                 "inputs": inputs,
                 "query": user_query,
@@ -298,17 +358,17 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                 "conversation_id": conversation_id,
                 "user": user_id
             }
-            
+
             # 如果有上传的文件，添加到请求中
             if uploaded_files:
                 dify_request["files"] = uploaded_files
-                
+
         else:  # history_message模式(默认)
             # 构造历史消息
             if len(messages) > 1:
                 history_messages = []
                 has_system_in_history = False
-                
+
                 # 检查历史消息中是否已经包含system消息
                 for msg in messages[:-1]:  # 除了最后一条消息
                     role = msg.get("role", "")
@@ -317,12 +377,12 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
                         if role == "system":
                             has_system_in_history = True
                         history_messages.append(f"{role}: {content}")
-                
+
                 # 如果历史中没有system消息但现在有system消息，则添加到历史的最前面
                 if system_content and not has_system_in_history:
                     history_messages.insert(0, f"system: {system_content}")
                     logger.info(f"[history_message模式] 添加system内容到历史消息前")
-                
+
                 # 将历史消息添加到查询中
                 if history_messages:
                     history_context = "\n\n".join(history_messages)
@@ -330,34 +390,35 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
             elif system_content:  # 没有历史消息但有system消息
                 user_query = f"系统指令: {system_content}\n\n用户问题: {user_query}"
                 logger.info(f"[history_message模式] 首次对话，添加system内容到查询前")
-            
+
             dify_request = {
                 "inputs": inputs,
                 "query": user_query,
                 "response_mode": "streaming" if stream else "blocking",
                 "user": user_id
             }
-            
+
             # 如果有上传的文件，添加到请求中
             if uploaded_files:
                 dify_request["files"] = uploaded_files
 
         return dify_request
-    
+
     return None
+
 
 def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream=False):
     """将Dify格式的响应转换为OpenAI格式"""
-    
+
     if not stream:
         # 首先获取回答内容，支持不同的响应模式
         answer = ""
         mode = dify_response.get("mode", "")
-        
+
         # 普通聊天模式
         if "answer" in dify_response:
             answer = dify_response.get("answer", "")
-        
+
         # 如果是Agent模式，需要从agent_thoughts中提取回答
         elif "agent_thoughts" in dify_response:
             # Agent模式下通常最后一个thought包含最终答案
@@ -366,12 +427,60 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
                 for thought in agent_thoughts:
                     if thought.get("thought"):
                         answer = thought.get("thought", "")
-        
+
+        # 解析tool_use标签
+        cleaned_content, tool_calls = parse_tool_use_from_content(answer)
+
+        # 如果有tool_calls，按照OpenAI的function call格式返回
+        if tool_calls:
+            response_data = {
+                "id": dify_response.get("message_id", str(uuid.uuid4())),
+                "object": "chat.completion",
+                "created": dify_response.get("created", int(time.time())),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": cleaned_content if cleaned_content else None,
+                        "tool_calls": tool_calls
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }
+
+            # 只在零宽字符会话记忆模式时处理conversation_id
+            if CONVERSATION_MEMORY_MODE == 2:
+                conversation_id = dify_response.get("conversation_id", "")
+                history = dify_response.get("conversation_history", [])
+
+                # 检查历史消息中是否已经有会话ID
+                has_conversation_id = False
+                if history:
+                    for msg in history:
+                        if msg.get("role") == "assistant":
+                            content = msg.get("content", "")
+                            if decode_conversation_id(content) is not None:
+                                has_conversation_id = True
+                                break
+
+                # 只在新会话且历史消息中没有会话ID时插入
+                if conversation_id and not has_conversation_id:
+                    logger.info(f"[Debug] Inserting conversation_id: {conversation_id}, history_length: {len(history)}")
+                    encoded = encode_conversation_id(conversation_id)
+                    if cleaned_content:
+                        response_data["choices"][0]["message"]["content"] = cleaned_content + encoded
+                    else:
+                        response_data["choices"][0]["message"]["content"] = encoded
+
+            return response_data
+
+        # 没有tool_calls的情况
         # 只在零宽字符会话记忆模式时处理conversation_id
         if CONVERSATION_MEMORY_MODE == 2:
             conversation_id = dify_response.get("conversation_id", "")
             history = dify_response.get("conversation_history", [])
-            
+
             # 检查历史消息中是否已经有会话ID
             has_conversation_id = False
             if history:
@@ -381,14 +490,14 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
                         if decode_conversation_id(content) is not None:
                             has_conversation_id = True
                             break
-            
+
             # 只在新会话且历史消息中没有会话ID时插入
             if conversation_id and not has_conversation_id:
                 logger.info(f"[Debug] Inserting conversation_id: {conversation_id}, history_length: {len(history)}")
                 encoded = encode_conversation_id(conversation_id)
                 answer = answer + encoded
                 logger.info(f"[Debug] Response content after insertion: {repr(answer)}")
-        
+
         return {
             "id": dify_response.get("message_id", ""),
             "object": "chat.completion",
@@ -407,6 +516,7 @@ def transform_dify_to_openai(dify_response, model="claude-3-5-sonnet-v2", stream
         # 流式响应的转换在stream_response函数中处理
         return dify_response
 
+
 def create_openai_stream_response(content, message_id, model="claude-3-5-sonnet-v2"):
     """创建OpenAI格式的流式响应"""
     return {
@@ -423,15 +533,34 @@ def create_openai_stream_response(content, message_id, model="claude-3-5-sonnet-
         }]
     }
 
+
+def create_openai_tool_call_stream_response(tool_calls, message_id, model="claude-3-5-sonnet-v2"):
+    """创建OpenAI格式的tool call流式响应"""
+    return {
+        "id": message_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": tool_calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }
+
+
 def encode_conversation_id(conversation_id):
     """将conversation_id编码为不可见的字符序列"""
     if not conversation_id:
         return ""
-    
+
     # 使用Base64编码减少长度
     import base64
     encoded = base64.b64encode(conversation_id.encode()).decode()
-    
+
     # 使用8种不同的零宽字符表示3位数字
     # 这样可以将编码长度进一步减少
     char_map = {
@@ -444,7 +573,7 @@ def encode_conversation_id(conversation_id):
         '6': '\u2061',  # 函数应用
         '7': '\u2062',  # 不可见乘号
     }
-    
+
     # 将Base64字符串转换为八进制数字
     result = []
     for c in encoded:
@@ -462,15 +591,16 @@ def encode_conversation_id(conversation_id):
             val = 63
         else:  # '='
             val = 0
-            
+
         # 每个Base64字符可以产生2个3位数字
         first = (val >> 3) & 0x7
         second = val & 0x7
         result.append(char_map[str(first)])
         if c != '=':  # 不编码填充字符的后半部分
             result.append(char_map[str(second)])
-    
+
     return ''.join(result)
+
 
 def decode_conversation_id(content):
     """从消息内容中解码conversation_id"""
@@ -486,17 +616,17 @@ def decode_conversation_id(content):
             '\u2061': '6',  # 函数应用
             '\u2062': '7',  # 不可见乘号
         }
-        
+
         # 提取最后一段零宽字符序列
         space_chars = []
         for c in reversed(content):
             if c not in char_to_val:
                 break
             space_chars.append(c)
-        
+
         if not space_chars:
             return None
-            
+
         # 将零宽字符转换回Base64字符串
         space_chars.reverse()
         base64_chars = []
@@ -507,7 +637,7 @@ def decode_conversation_id(content):
                 val = (first << 3) | second
             else:
                 val = first << 3
-                
+
             # 转换回Base64字符
             if val < 26:
                 base64_chars.append(chr(val + ord('A')))
@@ -519,20 +649,21 @@ def decode_conversation_id(content):
                 base64_chars.append('+')
             else:
                 base64_chars.append('/')
-                
+
         # 添加Base64填充
         padding = len(base64_chars) % 4
         if padding:
             base64_chars.extend(['='] * (4 - padding))
-            
+
         # 解码Base64字符串
         import base64
         base64_str = ''.join(base64_chars)
         return base64.b64decode(base64_str).decode()
-        
+
     except Exception as e:
         logger.debug(f"Failed to decode conversation_id: {e}")
         return None
+
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
@@ -573,11 +704,11 @@ def chat_completions():
 
         # 继续处理原始逻辑
         openai_request = request.get_json(force=True)
-        
+
         logger.info(f"Received request: {json.dumps(openai_request, ensure_ascii=False)}")
-        
+
         model = openai_request.get("model", "claude-3-5-sonnet")
-        
+
         # 验证模型是否支持
         api_key = get_api_key(model)
         if not api_key:
@@ -590,10 +721,10 @@ def chat_completions():
                     "code": "model_not_found"
                 }
             }, 404
-            
+
         # 转换请求并处理图片上传
         dify_request = asyncio.run(transform_openai_to_dify(openai_request, "/chat/completions", api_key))
-        
+
         # Debug模式下打印转换后的请求
         if '--debug' in sys.argv:
             print("=" * 50)
@@ -601,7 +732,7 @@ def chat_completions():
             print("=" * 50)
             print(f"Transformed Body: {json.dumps(dify_request, ensure_ascii=False, indent=2)}")
             print("=" * 50)
-        
+
         if not dify_request:
             logger.error("Failed to transform request")
             return {
@@ -623,11 +754,11 @@ def chat_completions():
         if stream:
             def generate():
                 client = httpx.Client(timeout=None)
-                
+
                 def flush_chunk(chunk_data):
                     """Helper function to flush chunks immediately"""
                     return chunk_data.encode('utf-8')
-                
+
                 def calculate_delay(buffer_size):
                     """
                     根据缓冲区大小动态计算延迟
@@ -641,7 +772,7 @@ def chat_completions():
                         return 0.01  # 20ms延迟
                     else:  # 内容很少，使用较慢的速度
                         return 0.02  # 30ms延迟
-                
+
                 def send_char(char, message_id):
                     """Helper function to send single character"""
                     openai_chunk = {
@@ -659,56 +790,58 @@ def chat_completions():
                     }
                     chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
                     return flush_chunk(chunk_data)
-                
+
                 # 初始化缓冲区
                 output_buffer = []
-                
+                accumulated_content = ""  # 用于累积内容以检测tool_use
+
                 try:
                     with client.stream(
-                        'POST',
-                        dify_endpoint,
-                        json=dify_request,
-                        headers={
-                            **headers,
-                            'Accept': 'text/event-stream',
-                            'Cache-Control': 'no-cache',
-                            'Connection': 'keep-alive'
-                        }
+                            'POST',
+                            dify_endpoint,
+                            json=dify_request,
+                            headers={
+                                **headers,
+                                'Accept': 'text/event-stream',
+                                'Cache-Control': 'no-cache',
+                                'Connection': 'keep-alive'
+                            }
                     ) as response:
                         generate.message_id = None
                         buffer = ""
-                        
+
                         for raw_bytes in response.iter_raw():
                             if not raw_bytes:
                                 continue
-                                
+
                             try:
                                 buffer += raw_bytes.decode('utf-8')
-                                
+
                                 while '\n' in buffer:
                                     line, buffer = buffer.split('\n', 1)
                                     line = line.strip()
-                                    
+
                                     if not line or not line.startswith('data: '):
                                         continue
-                                        
+
                                     try:
                                         json_str = line[6:]
                                         dify_chunk = json.loads(json_str)
-                                        
+
                                         if dify_chunk.get("event") == "message" and "answer" in dify_chunk:
                                             current_answer = dify_chunk["answer"]
                                             if not current_answer:
                                                 continue
-                                                
+
                                             message_id = dify_chunk.get("message_id", "")
                                             if not generate.message_id:
                                                 generate.message_id = message_id
-                                            
+
                                             # 将当前批次的字符添加到输出缓冲区
                                             for char in current_answer:
                                                 output_buffer.append((char, generate.message_id))
-                                            
+                                                accumulated_content += char
+
                                             # 根据缓冲区大小动态调整输出速度
                                             while output_buffer:
                                                 char, msg_id = output_buffer.pop(0)
@@ -716,24 +849,25 @@ def chat_completions():
                                                 # 根据剩余缓冲区大小计算延迟
                                                 delay = calculate_delay(len(output_buffer))
                                                 time.sleep(delay)
-                                            
+
                                             # 立即继续处理下一个请求
                                             continue
-                                        
+
                                         # 处理Agent模式的消息事件
                                         elif dify_chunk.get("event") == "agent_message" and "answer" in dify_chunk:
                                             current_answer = dify_chunk["answer"]
                                             if not current_answer:
                                                 continue
-                                                
+
                                             message_id = dify_chunk.get("message_id", "")
                                             if not generate.message_id:
                                                 generate.message_id = message_id
-                                            
+
                                             # 将当前批次的字符添加到输出缓冲区
                                             for char in current_answer:
                                                 output_buffer.append((char, generate.message_id))
-                                            
+                                                accumulated_content += char
+
                                             # 根据缓冲区大小动态调整输出速度
                                             while output_buffer:
                                                 char, msg_id = output_buffer.pop(0)
@@ -741,10 +875,10 @@ def chat_completions():
                                                 # 根据剩余缓冲区大小计算延迟
                                                 delay = calculate_delay(len(output_buffer))
                                                 time.sleep(delay)
-                                            
+
                                             # 立即继续处理下一个请求
                                             continue
-                                        
+
                                         # 处理Agent的思考过程，记录日志但不输出给用户
                                         elif dify_chunk.get("event") == "agent_thought":
                                             thought_id = dify_chunk.get("id", "")
@@ -752,7 +886,7 @@ def chat_completions():
                                             tool = dify_chunk.get("tool", "")
                                             tool_input = dify_chunk.get("tool_input", "")
                                             observation = dify_chunk.get("observation", "")
-                                            
+
                                             logger.info(f"[Agent Thought] ID: {thought_id}, Tool: {tool}")
                                             if thought:
                                                 logger.info(f"[Agent Thought] Thought: {thought}")
@@ -760,35 +894,61 @@ def chat_completions():
                                                 logger.info(f"[Agent Thought] Tool Input: {tool_input}")
                                             if observation:
                                                 logger.info(f"[Agent Thought] Observation: {observation}")
-                                            
+
                                             # 获取message_id以关联思考和最终输出
                                             message_id = dify_chunk.get("message_id", "")
                                             if not generate.message_id and message_id:
                                                 generate.message_id = message_id
-                                            
+
                                             continue
-                                        
+
                                         # 处理消息中的文件(如图片)，记录日志但不直接输出给用户
                                         elif dify_chunk.get("event") == "message_file":
                                             file_id = dify_chunk.get("id", "")
                                             file_type = dify_chunk.get("type", "")
                                             file_url = dify_chunk.get("url", "")
-                                            
-                                            logger.info(f"[Message File] ID: {file_id}, Type: {file_type}, URL: {file_url}")
+
+                                            logger.info(
+                                                f"[Message File] ID: {file_id}, Type: {file_type}, URL: {file_url}")
                                             continue
-                                        
+
                                         elif dify_chunk.get("event") == "message_end":
                                             # 快速输出剩余内容
                                             while output_buffer:
                                                 char, msg_id = output_buffer.pop(0)
                                                 yield send_char(char, msg_id)
                                                 time.sleep(0.001)  # 固定使用最小延迟快速输出剩余内容
-                                            
+
+                                            # 处理tool_use标签（在流式响应结束时解析）
+                                            if accumulated_content:
+                                                cleaned_content, tool_calls = parse_tool_use_from_content(
+                                                    accumulated_content)
+
+                                                if tool_calls:
+                                                    # 发送tool call响应
+                                                    tool_call_chunk = {
+                                                        "id": generate.message_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "role": "assistant",
+                                                                "tool_calls": tool_calls
+                                                            },
+                                                            "finish_reason": "tool_calls"
+                                                        }]
+                                                    }
+                                                    yield flush_chunk(f"data: {json.dumps(tool_call_chunk)}\n\n")
+                                                    yield flush_chunk("data: [DONE]\n\n")
+                                                    return
+
                                             # 只在零宽字符会话记忆模式时处理conversation_id
                                             if CONVERSATION_MEMORY_MODE == 2:
                                                 conversation_id = dify_chunk.get("conversation_id")
                                                 history = dify_chunk.get("conversation_history", [])
-                                                
+
                                                 has_conversation_id = False
                                                 if history:
                                                     for msg in history:
@@ -797,15 +957,16 @@ def chat_completions():
                                                             if decode_conversation_id(content) is not None:
                                                                 has_conversation_id = True
                                                                 break
-                                                
+
                                                 # 只在新会话且历史消息中没有会话ID时插入
                                                 if conversation_id and not has_conversation_id:
-                                                    logger.info(f"[Debug] Inserting conversation_id in stream: {conversation_id}")
+                                                    logger.info(
+                                                        f"[Debug] Inserting conversation_id in stream: {conversation_id}")
                                                     encoded = encode_conversation_id(conversation_id)
                                                     logger.info(f"[Debug] Stream encoded content: {repr(encoded)}")
                                                     for char in encoded:
                                                         yield send_char(char, generate.message_id)
-                                            
+
                                             final_chunk = {
                                                 "id": generate.message_id,
                                                 "object": "chat.completion.chunk",
@@ -819,11 +980,11 @@ def chat_completions():
                                             }
                                             yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
                                             yield flush_chunk("data: [DONE]\n\n")
-                                        
+
                                     except json.JSONDecodeError as e:
                                         logger.error(f"JSON decode error: {str(e)}")
                                         continue
-                                        
+
                             except Exception as e:
                                 logger.error(f"Error processing chunk: {str(e)}")
                                 continue
@@ -850,7 +1011,7 @@ def chat_completions():
                             json=dify_request,
                             headers=headers
                         )
-                        
+
                         if response.status_code != 200:
                             error_msg = f"Dify API error: {response.text}"
                             logger.error(f"Request failed: {error_msg}")
@@ -900,17 +1061,18 @@ def chat_completions():
             }
         }, 500
 
+
 @app.route('/v1/models', methods=['GET'])
 def list_models():
     """返回可用的模型列表"""
     logger.info("Listing available models")
-    
+
     # 刷新模型信息
     asyncio.run(model_manager.refresh_model_info())
-    
+
     # 获取可用模型列表
     available_models = model_manager.get_available_models()
-    
+
     response = {
         "object": "list",
         "data": available_models
@@ -918,22 +1080,23 @@ def list_models():
     logger.info(f"Available models: {json.dumps(response, ensure_ascii=False)}")
     return response
 
+
 import sys
 
 # 在main.py的最后初始化时添加环境变量检查：
 if __name__ == '__main__':
     # 检查命令行参数
     debug_mode = '--debug' in sys.argv
-    
+
     if not VALID_API_KEYS:
         print("Warning: No API keys configured. Set the VALID_API_KEYS environment variable with comma-separated keys.")
-    
+
     # 启动时初始化模型信息
     asyncio.run(model_manager.refresh_model_info())
-    
+
     host = os.getenv("SERVER_HOST", "127.0.0.1")
     port = int(os.getenv("SERVER_PORT", 5000))
     logger.info(f"Starting server on http://{host}:{port}")
-    
+
     # 根据debug参数决定是否启用debug模式
     app.run(debug=debug_mode, host=host, port=port)
