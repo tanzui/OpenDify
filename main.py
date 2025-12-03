@@ -197,7 +197,7 @@ async def transform_openai_to_dify(openai_request, endpoint, api_key=None):
     if endpoint == "/chat/completions":
         messages = openai_request.get("messages", [])
         stream = openai_request.get("stream", False)
-        user_id = openai_request.get("user", "default_user")
+        user_id = openai_request.get("user") or "default_user"
         inputs = openai_request.get("inputs", {})
         
         # 尝试从历史消息中提取conversation_id
@@ -572,7 +572,7 @@ def chat_completions():
             }), 401
 
         # 继续处理原始逻辑
-        openai_request = request.get_json()
+        openai_request = request.get_json(force=True)
         
         logger.info(f"Received request: {json.dumps(openai_request, ensure_ascii=False)}")
         
